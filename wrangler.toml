@@ -14,3 +14,11 @@ class_name = "DORM"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DORM"]
+
+# wrangler.toml
+[[r2_buckets]]
+bucket_name = "stripeimages"
+binding = "stripeimages"
+
+[vars]
+R2_PUBLIC_URL = "https://stripeimages.brubslabs.com"

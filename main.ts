@@ -1,27 +1,69 @@
 import { withStripeflare, StripeUser, DORM } from "stripeflare";
 export { DORM };
 
-// Separate HTML generation function
-function generatePaymentRequiredHtml(user: any, paymentLink: string): string {
-  return `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Payment Required</title>
-</head>
-<body>
-  <h1>💳 Payment Required</h1>
-  <p><strong>User:</strong> ${user?.name || "Unknown"}</p>
-  <p><strong>Balance:</strong> ${(user?.balance || 0) / 100}</p>
-  <p><a href="${paymentLink}">Pay Now</a></p>
-</body>
-</html>`;
+// Generate unique filename
+function generateImageFilename(
+  userId: string,
+  prompt: string,
+  index: number = 0
+): string {
+  const timestamp = Date.now();
+  const promptHash = prompt.slice(0, 20).replace(/[^a-zA-Z0-9]/g, "");
+  return `images/${userId}/${timestamp}-${promptHash}-${index}.png`;
 }
 
+// Save image to Cloudflare R2
+async function saveImageToR2(
+  env: any,
+  imageData: string | ArrayBuffer,
+  filename: string,
+  isBase64: boolean = false
+): Promise<string> {
+  try {
+    let imageBuffer: ArrayBuffer;
+
+    if (isBase64 && typeof imageData === "string") {
+      // Convert base64 to ArrayBuffer
+      const binaryString = atob(imageData);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      imageBuffer = bytes.buffer;
+    } else if (typeof imageData === "string") {
+      // Fetch image from URL
+      const response = await fetch(imageData);
+      if (!response.ok) throw new Error("Failed to fetch image");
+      imageBuffer = await response.arrayBuffer();
+    } else {
+      imageBuffer = imageData;
+    }
+
+    // Upload to R2
+    await env.stripeimages.put(filename, imageBuffer, {
+      httpMetadata: {
+        contentType: "image/png",
+        cacheControl: "public, max-age=31536000", // 1 year cache
+      },
+    });
+
+    // Return public URL using environment variable with fallback
+    const isDev = env.ENVIRONMENT === "development";
+    const baseUrl = isDev
+      ? env.R2_DEV_URL || `https://pub-${env.R2_BUCKET_ID}.r2.dev`
+      : env.R2_PUBLIC_URL || "https:///stripeimages.brubslabs.com";
+    return `${baseUrl}/${filename}`;
+  } catch (error) {
+    console.error("Failed to save image to R2:", error);
+    throw error;
+  }
+}
+
+// Enhanced success HTML with saved URLs
 function generateSuccessHtml(
   user: any,
   prompt: string,
-  imageData: any,
+  savedImageUrls: string[],
   costInCents: number,
   speed: number,
   size: string,
@@ -29,23 +71,16 @@ function generateSuccessHtml(
   n: number
 ): string {
   let imagesHtml = "";
-  imageData.data.forEach((image: any, index: number) => {
-    let imageSource;
-    if (image.url) {
-      imageSource = image.url;
-    } else if (image.b64_json) {
-      imageSource = `data:image/png;base64,${image.b64_json}`;
-    } else {
-      imageSource = "";
-    }
-
-    if (imageSource) {
-      imagesHtml += `
-    <div>
-      <p>Image ${index + 1}</p>
-      <img src="${imageSource}" alt="Generated Image ${index + 1}" />
+  savedImageUrls.forEach((imageUrl: string, index: number) => {
+    imagesHtml += `
+    <div style="margin: 20px 0; text-align: center;">
+      <p><strong>Image ${index + 1}</strong></p>
+      <img src="${imageUrl}" alt="Generated Image ${
+      index + 1
+    }" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;" />
+      <br>
+      <a href="${imageUrl}" target="_blank" style="color: #0066cc; text-decoration: none;">🔗 Direct Link</a>
     </div>`;
-    }
   });
 
   return `
@@ -55,42 +90,46 @@ function generateSuccessHtml(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Image Generation Result</title>
+    <style>
+      body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+      .info-box { background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 15px 0; }
+      .settings { display: flex; gap: 20px; flex-wrap: wrap; }
+      .setting-item { background: white; padding: 10px; border-radius: 5px; border: 1px solid #ddd; }
+    </style>
 </head>
 <body>
     <div>
-        <div>
-            <h1>🎨 Image Generation Complete</h1>
-        </div>
+        <h1>🎨 Image Generation Complete</h1>
         
-        <div>
-            ✅ Successfully generated ${imageData.data.length} image${
-    imageData.data.length > 1 ? "s" : ""
+        <div class="info-box">
+            ✅ Successfully generated and saved ${savedImageUrls.length} image${
+    savedImageUrls.length > 1 ? "s" : ""
   }
         </div>
         
-        <div>
-            <strong>👤 User:</strong> ${user.name}<br>
-            <strong>💰 Balance:</strong> ${
+        <div class="info-box">
+            <strong>👤 User:</strong> ${user.email}<br>
+            <strong>💰 Balance:</strong> $${
               (user.balance - costInCents) / 100
             } (after charge)<br>
-            <strong>💸 Cost:</strong> ${costInCents / 100}<br>
+            <strong>💸 Cost:</strong> $${costInCents / 100}<br>
             <strong>⏱️ Processing Time:</strong> ${speed}ms
         </div>
         
-        <div>
+        <div class="info-box">
             <h3>📝 Prompt</h3>
             <p><em>"${prompt}"</em></p>
         </div>
         
         <h3>⚙️ Settings</h3>
-        <div>
-            <div>
+        <div class="settings">
+            <div class="setting-item">
                 <strong>Size</strong><br>${size}
             </div>
-            <div>
+            <div class="setting-item">
                 <strong>Quality</strong><br>${quality}
             </div>
-            <div>
+            <div class="setting-item">
                 <strong>Count</strong><br>${n}
             </div>
         </div>
@@ -99,7 +138,27 @@ function generateSuccessHtml(
             <h3>🖼️ Generated Images</h3>
             ${imagesHtml}
         </div>
+        
+        <div class="info-box" style="background: #e8f5e8;">
+            <strong>💾 Images Saved:</strong> Your images are permanently stored and accessible via the direct links above.
+        </div>
     </div>
+</body>
+</html>`;
+}
+
+function generatePaymentRequiredHtml(user: any, paymentLink: string): string {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Payment Required</title>
+</head>
+<body>
+  <h1>💳 Payment Required</h1>
+  <p><strong>User:</strong> ${user?.email || "Unknown"}</p>
+  <p><strong>Balance:</strong> $${(user?.balance || 0) / 100}</p>
+  <p><a href="${paymentLink}">Pay Now</a></p>
 </body>
 </html>`;
 }
@@ -127,7 +186,7 @@ export default {
     if (request.method !== "GET") {
       const markdown = `# Method Not Allowed
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 Use GET method to generate images.
@@ -142,7 +201,7 @@ Use GET method to generate images.
     }
 
     try {
-      // Parse query parameters to get image prompt and settings
+      // Parse query parameters
       const url = new URL(request.url);
       const prompt = url.searchParams.get("prompt");
       const size = url.searchParams.get("size") || "1024x1024";
@@ -153,7 +212,7 @@ Use GET method to generate images.
       if (!prompt || typeof prompt !== "string") {
         const markdown = `# Invalid Request
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 **Error:** Missing or invalid required query parameter: prompt
@@ -164,16 +223,15 @@ Use GET method to generate images.
         });
       }
 
-      // Validate other parameters
+      // Validate parameters (same as before)
       if (
-        typeof size !== "string" ||
         !["256x256", "512x512", "1024x1024", "1024x1792", "1792x1024"].includes(
           size
         )
       ) {
         const markdown = `# Invalid Request
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 **Error:** Invalid size. Must be one of: 256x256, 512x512, 1024x1024, 1024x1792, 1792x1024
@@ -190,7 +248,7 @@ Use GET method to generate images.
       ) {
         const markdown = `# Invalid Request
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 **Error:** Invalid quality. Must be "low", "medium", "high", or "auto"
@@ -204,7 +262,7 @@ Use GET method to generate images.
       if (isNaN(n) || n < 1 || n > 4) {
         const markdown = `# Invalid Request
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 **Error:** Invalid n. Must be a number between 1 and 4
@@ -224,16 +282,20 @@ Use GET method to generate images.
         costInCents = 2 * n; // 2 cents per standard image
       }
 
-      console.log({ user: ctx.user, prompt, costInCents });
+      // Add storage cost (minimal)
+      const storageCostInCents = Math.ceil(n * 0.1); // ~0.1 cent per image for storage
+      const totalCostInCents = costInCents + storageCostInCents;
 
-      // Charge the user before making the API call
-      const { charged, message } = await ctx.charge(costInCents, false);
+      console.log({ user: ctx.user, prompt, totalCostInCents });
+
+      // Charge the user
+      const { charged, message } = await ctx.charge(totalCostInCents, false);
 
       if (!charged) {
         const speed = Date.now() - t;
         const markdown = `# Payment Failed
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 **Error:** Could not charge user  
@@ -265,25 +327,21 @@ Use GET method to generate images.
         }
       );
 
-      const speed = Date.now() - t;
-
       if (!openaiResponse.ok) {
         const errorData = await openaiResponse.json();
-
-        // If OpenAI API fails, you might want to refund the user
-        // This depends on your business logic
         console.error("OpenAI API Error:", errorData);
 
+        const speed = Date.now() - t;
         const markdown = `# Image Generation Failed
 
-**User:** ${ctx.user.name}  
-**Balance:** $${(ctx.user.balance - costInCents) / 100} (after charge)
+**User:** ${ctx.user.email}  
+**Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)
 
 **Error:** Image generation failed  
 **Details:** ${JSON.stringify(errorData, null, 2)}  
 **Processing Time:** ${speed}ms
 
-> **Note:** You were charged $${costInCents / 100} for this request.
+> **Note:** You were charged $${totalCostInCents / 100} for this request.
 `;
         return new Response(markdown, {
           status: openaiResponse.status,
@@ -293,19 +351,56 @@ Use GET method to generate images.
 
       const imageData = (await openaiResponse.json()) as any;
 
-      // Generate HTML content using separated function
+      // Save images to R2 and get URLs
+      const savedImageUrls: string[] = [];
+
+      for (let i = 0; i < imageData.data.length; i++) {
+        const image = imageData.data[i];
+        const filename = generateImageFilename(
+          ctx.user.client_reference_id,
+          prompt,
+          i
+        );
+
+        try {
+          let savedUrl: string;
+
+          if (image.url) {
+            // Save from URL
+            savedUrl = await saveImageToR2(env, image.url, filename, false);
+          } else if (image.b64_json) {
+            // Save from base64
+            savedUrl = await saveImageToR2(env, image.b64_json, filename, true);
+          } else {
+            throw new Error("No image data found");
+          }
+
+          savedImageUrls.push(savedUrl);
+        } catch (error) {
+          console.error(`Failed to save image ${i}:`, error);
+          // Fallback to original URL or base64
+          if (image.url) {
+            savedImageUrls.push(image.url);
+          } else if (image.b64_json) {
+            savedImageUrls.push(`data:image/png;base64,${image.b64_json}`);
+          }
+        }
+      }
+
+      const speed = Date.now() - t;
+
+      // Generate HTML content with saved URLs
       const htmlContent = generateSuccessHtml(
         ctx.user,
         prompt,
-        imageData,
-        costInCents,
+        savedImageUrls,
+        totalCostInCents,
         speed,
         size,
         quality,
         n
       );
 
-      // Return HTML response
       return new Response(htmlContent, {
         status: 200,
         headers: {
@@ -321,7 +416,7 @@ Use GET method to generate images.
 
       const markdown = `# Internal Server Error
 
-**User:** ${ctx.user.name}  
+**User:** ${ctx.user.email}  
 **Balance:** $${ctx.user.balance / 100}
 
 **Error:** Internal server error  
