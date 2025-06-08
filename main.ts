@@ -59,8 +59,8 @@ async function saveImageToR2(
   }
 }
 
-// Enhanced success HTML with saved URLs
-function generateSuccessHtml(
+// Enhanced success markdown with saved URLs and image rendering
+function generateSuccessMarkdown(
   user: any,
   prompt: string,
   savedImageUrls: string[],
@@ -70,97 +70,67 @@ function generateSuccessHtml(
   quality: string,
   n: number
 ): string {
-  let imagesHtml = "";
+  let imagesMarkdown = "";
   savedImageUrls.forEach((imageUrl: string, index: number) => {
-    imagesHtml += `
-    <div style="margin: 20px 0; text-align: center;">
-      <p><strong>Image ${index + 1}</strong></p>
-      <img src="${imageUrl}" alt="Generated Image ${
-      index + 1
-    }" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;" />
-      <br>
-      <a href="${imageUrl}" target="_blank" style="color: #0066cc; text-decoration: none;">🔗 Direct Link</a>
-    </div>`;
+    imagesMarkdown += `
+### Image ${index + 1}
+
+![Generated Image ${index + 1}](${imageUrl})
+
+**Direct Link:** [🔗 ${imageUrl}](${imageUrl})
+
+---
+`;
   });
 
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Image Generation Result</title>
-    <style>
-      body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-      .info-box { background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 15px 0; }
-      .settings { display: flex; gap: 20px; flex-wrap: wrap; }
-      .setting-item { background: white; padding: 10px; border-radius: 5px; border: 1px solid #ddd; }
-    </style>
-</head>
-<body>
-    <div>
-        <h1>🎨 Image Generation Complete</h1>
-        
-        <div class="info-box">
-            ✅ Successfully generated and saved ${savedImageUrls.length} image${
+  return `# 🎨 Image Generation Complete
+
+✅ **Successfully generated and saved ${savedImageUrls.length} image${
     savedImageUrls.length > 1 ? "s" : ""
-  }
-        </div>
-        
-        <div class="info-box">
-            <strong>👤 User:</strong> ${user.email}<br>
-            <strong>💰 Balance:</strong> $${
-              (user.balance - costInCents) / 100
-            } (after charge)<br>
-            <strong>💸 Cost:</strong> $${costInCents / 100}<br>
-            <strong>⏱️ Processing Time:</strong> ${speed}ms
-        </div>
-        
-        <div class="info-box">
-            <h3>📝 Prompt</h3>
-            <p><em>"${prompt}"</em></p>
-        </div>
-        
-        <h3>⚙️ Settings</h3>
-        <div class="settings">
-            <div class="setting-item">
-                <strong>Size</strong><br>${size}
-            </div>
-            <div class="setting-item">
-                <strong>Quality</strong><br>${quality}
-            </div>
-            <div class="setting-item">
-                <strong>Count</strong><br>${n}
-            </div>
-        </div>
-        
-        <div>
-            <h3>🖼️ Generated Images</h3>
-            ${imagesHtml}
-        </div>
-        
-        <div class="info-box" style="background: #e8f5e8;">
-            <strong>💾 Images Saved:</strong> Your images are permanently stored and accessible via the direct links above.
-        </div>
-    </div>
-</body>
-</html>`;
+  }**
+
+## 📊 Generation Details
+
+**👤 User:** ${user.email}  
+**💰 Balance:** $${(user.balance - costInCents) / 100} (after charge)  
+**💸 Cost:** $${costInCents / 100}  
+**⏱️ Processing Time:** ${speed}ms
+
+## 📝 Prompt
+
+> *"${prompt}"*
+
+## ⚙️ Settings
+
+| Setting | Value |
+|---------|-------|
+| **Size** | ${size} |
+| **Quality** | ${quality} |
+| **Count** | ${n} |
+
+## 🖼️ Generated Images
+
+${imagesMarkdown}
+
+## 💾 Storage Info
+
+Your images are permanently stored and accessible via the direct links above. Images are cached for optimal performance and availability.`;
 }
 
-function generatePaymentRequiredHtml(user: any, paymentLink: string): string {
-  return `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Payment Required</title>
-</head>
-<body>
-  <h1>💳 Payment Required</h1>
-  <p><strong>User:</strong> ${user?.email || "Unknown"}</p>
-  <p><strong>Balance:</strong> $${(user?.balance || 0) / 100}</p>
-  <p><a href="${paymentLink}">Pay Now</a></p>
-</body>
-</html>`;
+function generatePaymentRequiredMarkdown(
+  user: any,
+  paymentLink: string
+): string {
+  return `# 💳 Payment Required
+
+**User:** ${user?.email || "Unknown"}  
+**Balance:** $${(user?.balance || 0) / 100}
+
+[**Pay Now →**](${paymentLink})
+
+---
+
+*You need to add funds to your account to generate images.*`;
 }
 
 export default {
@@ -169,14 +139,14 @@ export default {
 
     // Check if user is registered and has balance
     if (!ctx.registered || ctx.user.balance <= 0) {
-      const htmlContent = generatePaymentRequiredHtml(
+      const markdownContent = generatePaymentRequiredMarkdown(
         ctx.user,
         ctx.paymentLink
       );
-      return new Response(htmlContent, {
+      return new Response(markdownContent, {
         status: 402,
         headers: {
-          "Content-Type": "text/html",
+          "Content-Type": "text/markdown",
           Location: ctx.paymentLink,
         },
       });
@@ -338,7 +308,11 @@ Use GET method to generate images.
 **Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)
 
 **Error:** Image generation failed  
-**Details:** ${JSON.stringify(errorData, null, 2)}  
+**Details:** 
+\`\`\`json
+${JSON.stringify(errorData, null, 2)}
+\`\`\`
+
 **Processing Time:** ${speed}ms
 
 > **Note:** You were charged $${totalCostInCents / 100} for this request.
@@ -389,8 +363,8 @@ Use GET method to generate images.
 
       const speed = Date.now() - t;
 
-      // Generate HTML content with saved URLs
-      const htmlContent = generateSuccessHtml(
+      // Generate markdown content with saved URLs and image rendering
+      const markdownContent = generateSuccessMarkdown(
         ctx.user,
         prompt,
         savedImageUrls,
@@ -401,10 +375,10 @@ Use GET method to generate images.
         n
       );
 
-      return new Response(htmlContent, {
+      return new Response(markdownContent, {
         status: 200,
         headers: {
-          "Content-Type": "text/html",
+          "Content-Type": "text/markdown",
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET",
           "Access-Control-Allow-Headers": "Content-Type",
