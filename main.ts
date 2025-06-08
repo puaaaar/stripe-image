@@ -59,62 +59,24 @@ async function saveImageToR2(
   }
 }
 
-// Enhanced success markdown with saved URLs and image rendering
-function generateSuccessMarkdown(
-  user: any,
-  prompt: string,
-  savedImageUrls: string[],
-  costInCents: number,
-  speed: number,
-  size: string,
-  quality: string,
-  n: number
-): string {
-  let imagesMarkdown = "";
-  savedImageUrls.forEach((imageUrl: string, index: number) => {
-    imagesMarkdown += `
-### Image ${index + 1}
-
-![Generated Image ${index + 1}](${imageUrl})
-
-**Direct Link:** [🔗 ${imageUrl}](${imageUrl})
-
----
-`;
-  });
-
-  return `# 🎨 Image Generation Complete
-
-✅ **Successfully generated and saved ${savedImageUrls.length} image${
-    savedImageUrls.length > 1 ? "s" : ""
-  }**
-
-## 📊 Generation Details
-
-**👤 User:** ${user.email}  
-**💰 Balance:** $${(user.balance - costInCents) / 100} (after charge)  
-**💸 Cost:** $${costInCents / 100}  
-**⏱️ Processing Time:** ${speed}ms
-
-## 📝 Prompt
-
-> *"${prompt}"*
-
-## ⚙️ Settings
-
-| Setting | Value |
-|---------|-------|
-| **Size** | ${size} |
-| **Quality** | ${quality} |
-| **Count** | ${n} |
-
-## 🖼️ Generated Images
-
-${imagesMarkdown}
-
-## 💾 Storage Info
-
-Your images are permanently stored and accessible via the direct links above. Images are cached for optimal performance and availability.`;
+// Convert image data to ArrayBuffer for response
+async function getImageBuffer(imageData: any): Promise<ArrayBuffer> {
+  if (imageData.url) {
+    // Fetch from URL
+    const response = await fetch(imageData.url);
+    if (!response.ok) throw new Error("Failed to fetch image");
+    return await response.arrayBuffer();
+  } else if (imageData.b64_json) {
+    // Convert base64 to ArrayBuffer
+    const binaryString = atob(imageData.b64_json);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+  } else {
+    throw new Error("No image data found");
+  }
 }
 
 function generatePaymentRequiredMarkdown(
@@ -178,6 +140,7 @@ Use GET method to generate images.
       const quality = url.searchParams.get("quality") || "low";
       const nParam = url.searchParams.get("n");
       const n = nParam ? parseInt(nParam, 10) : 1;
+      const format = url.searchParams.get("format") || "image"; // New parameter to choose response format
 
       if (!prompt || typeof prompt !== "string") {
         const markdown = `# Invalid Request
@@ -193,7 +156,7 @@ Use GET method to generate images.
         });
       }
 
-      // Validate parameters (same as before)
+      // Validate parameters
       if (
         !["256x256", "512x512", "1024x1024", "1024x1792", "1792x1024"].includes(
           size
@@ -243,8 +206,22 @@ Use GET method to generate images.
         });
       }
 
+      // For image response format, only allow n=1
+      if (format === "image" && n > 1) {
+        const markdown = `# Invalid Request
+
+**User:** ${ctx.user.email}  
+**Balance:** $${ctx.user.balance / 100}
+
+**Error:** When format=image, only n=1 is supported. Use format=markdown for multiple images.
+`;
+        return new Response(markdown, {
+          status: 400,
+          headers: { "Content-Type": "text/markdown" },
+        });
+      }
+
       // Calculate cost based on image parameters
-      // OpenAI pricing: HD 1024x1024 = $0.040, Standard 1024x1024 = $0.020
       let costInCents;
       if (quality === "high" || quality === "auto") {
         costInCents = 4 * n; // 4 cents per HD image
@@ -288,7 +265,7 @@ Use GET method to generate images.
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: "gpt-image-1",
+            model: "dall-e-3", // Updated to use DALL-E 3
             prompt: prompt,
             n: n,
             size: size,
@@ -325,7 +302,54 @@ ${JSON.stringify(errorData, null, 2)}
 
       const imageData = (await openaiResponse.json()) as any;
 
-      // Save images to R2 and get URLs
+      // If format is "image", return the first image directly
+      if (format === "image") {
+        try {
+          const firstImage = imageData.data[0];
+          const imageBuffer = await getImageBuffer(firstImage);
+
+          // Save to R2 in the background (don't await)
+          const filename = generateImageFilename(
+            ctx.user.client_reference_id,
+            prompt,
+            0
+          );
+          saveImageToR2(env, imageBuffer, filename, false).catch((error) => {
+            console.error("Background save to R2 failed:", error);
+          });
+
+          // Return the image directly
+          return new Response(imageBuffer, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/png",
+              "Content-Disposition": `inline; filename="${filename}"`,
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Methods": "GET",
+              "Access-Control-Allow-Headers": "Content-Type",
+              "Cache-Control": "public, max-age=3600", // Cache for 1 hour
+            },
+          });
+        } catch (error) {
+          console.error("Failed to process image:", error);
+          const markdown = `# Image Processing Failed
+
+**User:** ${ctx.user.email}  
+**Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)
+
+**Error:** Failed to process generated image  
+**Message:** ${error instanceof Error ? error.message : "Unknown error"}
+
+> **Note:** You were charged $${totalCostInCents / 100} for this request.
+`;
+          return new Response(markdown, {
+            status: 500,
+            headers: { "Content-Type": "text/markdown" },
+          });
+        }
+      }
+
+      // Original markdown response for multiple images or when format=markdown
       const savedImageUrls: string[] = [];
 
       for (let i = 0; i < imageData.data.length; i++) {
@@ -364,16 +388,55 @@ ${JSON.stringify(errorData, null, 2)}
       const speed = Date.now() - t;
 
       // Generate markdown content with saved URLs and image rendering
-      const markdownContent = generateSuccessMarkdown(
-        ctx.user,
-        prompt,
-        savedImageUrls,
-        totalCostInCents,
-        speed,
-        size,
-        quality,
-        n
-      );
+      let imagesMarkdown = "";
+      savedImageUrls.forEach((imageUrl: string, index: number) => {
+        imagesMarkdown += `
+### Image ${index + 1}
+
+![Generated Image ${index + 1}](${imageUrl})
+
+**Direct Link:** [🔗 ${imageUrl}](${imageUrl})
+
+---
+`;
+      });
+
+      const markdownContent = `# 🎨 Image Generation Complete
+
+✅ **Successfully generated and saved ${savedImageUrls.length} image${
+        savedImageUrls.length > 1 ? "s" : ""
+      }**
+
+## 📊 Generation Details
+
+**👤 User:** ${ctx.user.email}  
+**💰 Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)  
+**💸 Cost:** $${totalCostInCents / 100}  
+**⏱️ Processing Time:** ${speed}ms
+
+## 📝 Prompt
+
+> *"${prompt}"*
+
+## ⚙️ Settings
+
+| Setting | Value |
+|---------|-------|
+| **Size** | ${size} |
+| **Quality** | ${quality} |
+| **Count** | ${n} |
+
+## 🖼️ Generated Images
+
+${imagesMarkdown}
+
+## 💾 Storage Info
+
+Your images are permanently stored and accessible via the direct links above. Images are cached for optimal performance and availability.
+
+## 💡 Tip
+
+Add \`?format=image\` to your URL to get the image directly instead of this markdown response (only works with n=1).`;
 
       return new Response(markdownContent, {
         status: 200,
