@@ -5,7 +5,7 @@ compatibility_date = "2025-06-06"
 
 dev.port = 3000
 routes = [
-  { pattern = "img.brubslabs.com", custom_domain = true }
+  { pattern = "image.brubslabs.com", custom_domain = true }
 ]
 
 [[durable_objects.bindings]]
@@ -22,4 +22,4 @@ bucket_name = "stripeimages"
 binding = "stripeimages"
 
 [vars]
-R2_PUBLIC_URL = "https://image.brubslabs.com"
+R2_PUBLIC_URL = "https://imagebucket.brubslabs.com"

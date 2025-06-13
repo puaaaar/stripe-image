@@ -1,15 +1,22 @@
-import { withStripeflare, StripeUser, DORM } from "stripeflare";
+import {
+  withStripeflare,
+  StripeUser,
+  DORM,
+  Env as StripeflareEnv,
+} from "stripeflare";
 export { DORM };
 
-// Generate unique filename
-function generateImageFilename(prompt: string, index: number = 0): string {
-  const promptHash = prompt.slice(0, 20).replace(/[^a-zA-Z0-9]/g, "");
-  return `images/${promptHash}.png`;
-}
+type Env = StripeflareEnv & {
+  stripeimages: R2Bucket;
+  R2_PUBLIC_URL: string | undefined;
+  R2_DEV_URL: string | undefined;
+  R2_BUCKET_ID: string;
+  ENVIRONMENT: string;
+};
 
 // Save image to Cloudflare R2
 async function saveImageToR2(
-  env: any,
+  env: Env,
   imageData: string | ArrayBuffer,
   filename: string,
   isBase64: boolean = false
@@ -18,8 +25,11 @@ async function saveImageToR2(
     let imageBuffer: ArrayBuffer;
 
     if (isBase64 && typeof imageData === "string") {
+      // Strip data URL prefix if present (data:image/png;base64,)
+      const base64Data = imageData.replace(/^data:image\/[a-z]+;base64,/, "");
+
       // Convert base64 to ArrayBuffer
-      const binaryString = atob(imageData);
+      const binaryString = atob(base64Data);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
@@ -28,11 +38,16 @@ async function saveImageToR2(
     } else if (typeof imageData === "string") {
       // Fetch image from URL
       const response = await fetch(imageData);
-      if (!response.ok) throw new Error("Failed to fetch image");
+      if (!response.ok)
+        throw new Error(`Failed to fetch image: ${response.status}`);
       imageBuffer = await response.arrayBuffer();
     } else {
       imageBuffer = imageData;
     }
+
+    console.log(
+      `Uploading to R2: ${filename}, size: ${imageBuffer.byteLength} bytes`
+    );
 
     // Upload to R2
     await env.stripeimages.put(filename, imageBuffer, {
@@ -42,11 +57,13 @@ async function saveImageToR2(
       },
     });
 
+    console.log(`Successfully uploaded to R2: ${filename}`);
+
     // Return public URL using environment variable with fallback
     const isDev = env.ENVIRONMENT === "development";
     const baseUrl = isDev
       ? env.R2_DEV_URL || `https://pub-${env.R2_BUCKET_ID}.r2.dev`
-      : env.R2_PUBLIC_URL || "https://image.brubslabs.com";
+      : env.R2_PUBLIC_URL || "https://imagebucket.brubslabs.com";
     return `${baseUrl}/${filename}`;
   } catch (error) {
     console.error("Failed to save image to R2:", error);
@@ -57,15 +74,27 @@ async function saveImageToR2(
 // Convert image data to ArrayBuffer for response
 async function getImageBuffer(imageData: any): Promise<ArrayBuffer> {
   if (imageData.b64_json) {
+    // Strip data URL prefix if present
+    const base64Data = imageData.b64_json.replace(
+      /^data:image\/[a-z]+;base64,/,
+      ""
+    );
+
     // Convert base64 to ArrayBuffer
-    const binaryString = atob(imageData.b64_json);
+    const binaryString = atob(base64Data);
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
     return bytes.buffer;
+  } else if (imageData.url) {
+    // Fetch image from URL
+    const response = await fetch(imageData.url);
+    if (!response.ok)
+      throw new Error(`Failed to fetch image: ${response.status}`);
+    return await response.arrayBuffer();
   } else {
-    throw new Error("No image data found");
+    throw new Error("No image data found (neither b64_json nor url)");
   }
 }
 
@@ -98,7 +127,21 @@ function parseImagePath(
 }
 
 export default {
-  fetch: withStripeflare<StripeUser>(async (request, env, ctx) => {
+  fetch: withStripeflare<StripeUser>(async (request, env: Env, ctx) => {
+    const url = new URL(request.url);
+    const filename = url.pathname;
+
+    const already = await env.stripeimages.get(filename);
+    if (already) {
+      return new Response(already.body, {
+        headers: {
+          "Content-Type": already.httpMetadata?.contentType || "image/png",
+          "Content-Disposition": `inline; filename="${filename}"`,
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
     console.log("Request received:", ctx.registered, ctx.user.balance);
 
     // Check if user is registered and has balance
@@ -123,12 +166,11 @@ export default {
 
     try {
       // Parse URL path parameters
-      const url = new URL(request.url);
       const pathParams = parseImagePath(url.pathname);
 
       if (!pathParams) {
         return new Response(
-          `Welcome!
+          `Welcome to image.brubslabs.com!
           
 # Use the following format to generate images:
 
@@ -248,20 +290,33 @@ Examples:
       }
 
       const imageData = (await openaiResponse.json()) as any;
+      console.log("OpenAI API response received, processing image...");
 
       // Return the first image directly
       try {
         const firstImage = imageData.data[0];
-        console.log("First image data:", firstImage);
+        console.log("Processing first image...");
+
         const imageBuffer = await getImageBuffer(firstImage);
+        console.log(
+          `Image buffer created, size: ${imageBuffer.byteLength} bytes`
+        );
 
-        // Save to R2 in the background (don't await)
-        const filename = generateImageFilename(prompt);
-        saveImageToR2(env, imageBuffer, filename, false).catch((error) => {
-          console.error("Background save to R2 failed:", error);
-        });
-
-        console.log("Image saved to R2:", filename);
+        // Generate filename
+        const filename = url.pathname;
+        // Save to R2 - FIXED: Now properly awaited and handled
+        try {
+          const publicUrl = await saveImageToR2(
+            env,
+            imageBuffer,
+            filename,
+            false
+          );
+          console.log(`Image successfully saved to R2: ${publicUrl}`);
+        } catch (saveError) {
+          console.error("Failed to save to R2:", saveError);
+          // Continue anyway and return the image
+        }
 
         // Return the image directly
         return new Response(imageBuffer, {
