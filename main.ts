@@ -14,6 +14,185 @@ type Env = StripeflareEnv & {
   ENVIRONMENT: string;
 };
 
+// Cost calculation types
+interface ImageCostParams {
+  prompt: string;
+  size: string;
+  quality: string;
+  inputImageTokens?: number; // For image-to-image or input images
+  cachedInputTokens?: number; // For cached input tokens
+}
+
+interface ImageCostBreakdown {
+  textInputTokens: number;
+  textInputCost: number;
+  imageInputTokens: number;
+  imageInputCost: number;
+  imageOutputCost: number;
+  storageCost: number;
+  totalCostInCents: number;
+  breakdown: {
+    textInput: string;
+    imageInput: string;
+    imageOutput: string;
+    storage: string;
+    total: string;
+  };
+}
+
+// Pricing constants (in dollars)
+const PRICING = {
+  TEXT_INPUT_PER_1M: 5.0,
+  TEXT_INPUT_CACHED_PER_1M: 1.25,
+  IMAGE_INPUT_PER_1M: 10.0,
+  IMAGE_INPUT_CACHED_PER_1M: 2.5,
+  IMAGE_OUTPUT_PER_1M: 40.0,
+
+  // Output image costs (in dollars)
+  OUTPUT_COSTS: {
+    low: {
+      "1024x1024": 0.011,
+      "1024x1536": 0.016,
+      "1536x1024": 0.016,
+    },
+    medium: {
+      "1024x1024": 0.042,
+      "1024x1536": 0.063,
+      "1536x1024": 0.063,
+    },
+    high: {
+      "1024x1024": 0.167,
+      "1024x1536": 0.25,
+      "1536x1024": 0.25,
+    },
+    auto: {
+      // Same as high
+      "1024x1024": 0.167,
+      "1024x1536": 0.25,
+      "1536x1024": 0.25,
+    },
+  },
+
+  STORAGE_COST_PER_IMAGE: 0.001, // $0.001 per image for storage
+};
+
+/**
+ * Calculate image tokens based on dimensions
+ * Formula: Scale image so shortest side = 512px, count 512px tiles needed
+ * Cost: (tiles × 129) + 65 tokens
+ */
+function calculateImageTokens(width: number, height: number): number {
+  // Scale so shortest side = 512px
+  const shortestSide = Math.min(width, height);
+  const scaleFactor = 512 / shortestSide;
+
+  const scaledWidth = Math.ceil(width * scaleFactor);
+  const scaledHeight = Math.ceil(height * scaleFactor);
+
+  // Count 512px tiles needed
+  const tilesX = Math.ceil(scaledWidth / 512);
+  const tilesY = Math.ceil(scaledHeight / 512);
+  const totalTiles = tilesX * tilesY;
+
+  // Calculate tokens: (tiles × 129) + 65
+  return totalTiles * 129 + 65;
+}
+
+/**
+ * Estimate text tokens (rough approximation: 1 token ≈ 4 characters)
+ */
+function estimateTextTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Parse image size string to width and height
+ */
+function parseImageSize(size: string): { width: number; height: number } {
+  const [widthStr, heightStr] = size.split("x");
+  return {
+    width: parseInt(widthStr, 10),
+    height: parseInt(heightStr, 10),
+  };
+}
+
+/**
+ * Calculate comprehensive cost for image generation
+ */
+export function calculateImageGenerationCost(
+  params: ImageCostParams
+): ImageCostBreakdown {
+  const {
+    prompt,
+    size,
+    quality,
+    inputImageTokens = 0,
+    cachedInputTokens = 0,
+  } = params;
+
+  // Normalize quality
+  const normalizedQuality =
+    quality.toLowerCase() as keyof typeof PRICING.OUTPUT_COSTS;
+
+  // Calculate text input tokens and cost
+  const textInputTokens = estimateTextTokens(prompt);
+  const textInputCost =
+    cachedInputTokens > 0
+      ? (cachedInputTokens / 1_000_000) * PRICING.TEXT_INPUT_CACHED_PER_1M
+      : (textInputTokens / 1_000_000) * PRICING.TEXT_INPUT_PER_1M;
+
+  // Calculate image input tokens and cost
+  const imageInputCost =
+    inputImageTokens > 0
+      ? (inputImageTokens / 1_000_000) * PRICING.IMAGE_INPUT_PER_1M
+      : 0;
+
+  // Calculate image output cost
+  let imageOutputCost = 0;
+  let imageOutputTokens = 0;
+
+  if (
+    PRICING.OUTPUT_COSTS[normalizedQuality] &&
+    PRICING.OUTPUT_COSTS[normalizedQuality][size]
+  ) {
+    imageOutputCost = PRICING.OUTPUT_COSTS[normalizedQuality][size];
+  }
+
+  // Storage cost
+  const storageCost = PRICING.STORAGE_COST_PER_IMAGE;
+
+  // Total cost in dollars
+  const totalCostInDollars =
+    (textInputCost + imageInputCost + imageOutputCost + storageCost) * 0.2; // 20% fee
+  const totalCostInCents = Math.ceil(totalCostInDollars * 100);
+
+  return {
+    textInputTokens,
+    textInputCost,
+    imageInputTokens: inputImageTokens,
+    imageInputCost,
+    imageOutputCost,
+    storageCost,
+    totalCostInCents,
+    breakdown: {
+      textInput: `$${textInputCost.toFixed(
+        5
+      )} (${textInputTokens.toLocaleString()} tokens)`,
+      imageInput:
+        inputImageTokens > 0
+          ? `$${imageInputCost.toFixed(
+              5
+            )} (${inputImageTokens.toLocaleString()} tokens)`
+          : "$0.00000 (0 tokens)",
+      imageOutput: `$${imageOutputCost.toFixed(
+        5
+      )} (${imageOutputTokens.toLocaleString()} tokens)`,
+      storage: `$${storageCost.toFixed(5)}`,
+      total: `$${totalCostInDollars.toFixed(5)} (${totalCostInCents}¢)`,
+    },
+  };
+}
+
 // Save image to Cloudflare R2
 async function saveImageToR2(
   env: Env,
@@ -142,6 +321,92 @@ export default {
       });
     }
 
+    // Handle cost calculation endpoint
+    if (url.pathname.startsWith("/cost")) {
+      // Convert /cost/prompt/size/quality to /image/prompt/size/quality for parsing
+      const imagePath = url.pathname.replace("/cost/", "/image/");
+      const pathParams = parseImagePath(imagePath);
+
+      if (!pathParams) {
+        return new Response(
+          JSON.stringify(
+            {
+              error: "Invalid cost path format",
+              usage: "Use: /cost/prompt[/size][/quality]",
+              examples: [
+                "/cost/cat",
+                "/cost/cat/1024x1024",
+                "/cost/cat/1024x1024/high",
+              ],
+            },
+            null,
+            2
+          ),
+          {
+            status: 400,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
+      }
+
+      const { prompt, size, quality } = pathParams;
+
+      // Calculate cost breakdown
+      const costBreakdown = calculateImageGenerationCost({
+        prompt,
+        size,
+        quality,
+      });
+
+      // Build the response
+      const response = {
+        prompt,
+        size,
+        quality,
+        cost: {
+          breakdown: costBreakdown.breakdown,
+          totalCents: costBreakdown.totalCostInCents,
+          details: {
+            textInputTokens: costBreakdown.textInputTokens,
+            textInputCost: costBreakdown.textInputCost,
+            imageInputTokens: costBreakdown.imageInputTokens,
+            imageInputCost: costBreakdown.imageInputCost,
+            imageOutputCost: costBreakdown.imageOutputCost,
+            storageCost: costBreakdown.storageCost,
+          },
+        },
+        generation: {
+          url: `${url.origin}/image/${encodeURIComponent(
+            prompt
+          )}/${size}/${quality}`,
+          message: `To generate this image, visit the URL above. Cost: ${costBreakdown.breakdown.total}`,
+        },
+        user: ctx.registered
+          ? {
+              balance: ctx.user.balance,
+              canAfford: ctx.user.balance >= costBreakdown.totalCostInCents,
+              balanceAfter: ctx.user.balance - costBreakdown.totalCostInCents,
+            }
+          : {
+              message:
+                "User not registered. Visit payment link to add balance.",
+              paymentLink: ctx.paymentLink,
+            },
+      };
+
+      return new Response(JSON.stringify(response, null, 2), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
+
     console.log("Request received:", ctx.registered, ctx.user.balance);
 
     // Check if user is registered and has balance
@@ -226,16 +491,14 @@ Examples:
       console.log("Parsed parameters:", { prompt, size, quality });
 
       // Calculate cost based on image parameters
-      let costInCents;
-      if (quality === "high" || quality === "auto" || quality === "medium") {
-        costInCents = 4;
-      } else {
-        costInCents = 2;
-      }
+      const costBreakdown = calculateImageGenerationCost({
+        prompt,
+        size,
+        quality,
+      });
+      const totalCostInCents = costBreakdown.totalCostInCents;
 
-      // Add storage cost (minimal)
-      const storageCostInCents = Math.ceil(1 * 0.1); // ~0.1 cent per image for storage
-      const totalCostInCents = costInCents + storageCostInCents;
+      console.log("Cost breakdown:", costBreakdown);
 
       console.log({ user: ctx.user, prompt, totalCostInCents });
 
@@ -254,6 +517,7 @@ Examples:
         "User-Agent": "StripeImages/1.0",
         Accept: "application/json",
       };
+
       // Make request to OpenAI API
       const openaiResponse = await fetch(
         "https://api.openai.com/v1/images/generations",
