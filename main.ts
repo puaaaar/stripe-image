@@ -2,14 +2,9 @@ import { withStripeflare, StripeUser, DORM } from "stripeflare";
 export { DORM };
 
 // Generate unique filename
-function generateImageFilename(
-  userId: string,
-  prompt: string,
-  index: number = 0
-): string {
-  const timestamp = Date.now();
+function generateImageFilename(prompt: string, index: number = 0): string {
   const promptHash = prompt.slice(0, 20).replace(/[^a-zA-Z0-9]/g, "");
-  return `images/${userId}/${timestamp}-${promptHash}-${index}.png`;
+  return `images/${promptHash}.png`;
 }
 
 // Save image to Cloudflare R2
@@ -51,7 +46,7 @@ async function saveImageToR2(
     const isDev = env.ENVIRONMENT === "development";
     const baseUrl = isDev
       ? env.R2_DEV_URL || `https://pub-${env.R2_BUCKET_ID}.r2.dev`
-      : env.R2_PUBLIC_URL || "https:///stripeimages.brubslabs.com";
+      : env.R2_PUBLIC_URL || "https://image.brubslabs.com";
     return `${baseUrl}/${filename}`;
   } catch (error) {
     console.error("Failed to save image to R2:", error);
@@ -61,12 +56,7 @@ async function saveImageToR2(
 
 // Convert image data to ArrayBuffer for response
 async function getImageBuffer(imageData: any): Promise<ArrayBuffer> {
-  if (imageData.url) {
-    // Fetch from URL
-    const response = await fetch(imageData.url);
-    if (!response.ok) throw new Error("Failed to fetch image");
-    return await response.arrayBuffer();
-  } else if (imageData.b64_json) {
+  if (imageData.b64_json) {
     // Convert base64 to ArrayBuffer
     const binaryString = atob(imageData.b64_json);
     const bytes = new Uint8Array(binaryString.length);
@@ -79,36 +69,43 @@ async function getImageBuffer(imageData: any): Promise<ArrayBuffer> {
   }
 }
 
-function generatePaymentRequiredMarkdown(
-  user: any,
-  paymentLink: string
-): string {
-  return `# 💳 Payment Required
+// Parse URL path to extract parameters
+function parseImagePath(
+  pathname: string
+): { prompt: string; size: string; quality: string } | null {
+  // Remove leading slash and split by '/'
+  const parts = pathname
+    .replace(/^\/+/, "")
+    .split("/")
+    .filter((part) => part.length > 0);
 
-**User:** ${user?.email || "Unknown"}  
-**Balance:** $${(user?.balance || 0) / 100}
+  // Expected format: image/prompt[/size][/quality]
+  // Minimum requirement: image/prompt
+  if (parts.length < 2 || parts[0] !== "image") {
+    return null;
+  }
 
-[**Pay Now →**](${paymentLink})
+  // Extract parameters with defaults
+  const prompt = parts[1] ? decodeURIComponent(parts[1]) : "";
+  const size = parts[2] || "1024x1024";
+  const quality = parts[3] || "low";
 
----
+  if (!prompt) {
+    return null;
+  }
 
-*You need to add funds to your account to generate images.*`;
+  return { prompt, size, quality };
 }
 
 export default {
   fetch: withStripeflare<StripeUser>(async (request, env, ctx) => {
-    const t = Date.now();
+    console.log("Request received:", ctx.registered, ctx.user.balance);
 
     // Check if user is registered and has balance
     if (!ctx.registered || ctx.user.balance <= 0) {
-      const markdownContent = generatePaymentRequiredMarkdown(
-        ctx.user,
-        ctx.paymentLink
-      );
-      return new Response(markdownContent, {
-        status: 402,
+      return new Response(null, {
+        status: 302,
         headers: {
-          "Content-Type": "text/markdown",
           Location: ctx.paymentLink,
         },
       });
@@ -116,121 +113,86 @@ export default {
 
     // Only handle GET requests for image generation
     if (request.method !== "GET") {
-      const markdown = `# Method Not Allowed
-
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-Use GET method to generate images.
-`;
-      return new Response(markdown, {
+      return new Response("Method Not Allowed", {
         status: 405,
         headers: {
-          "Content-Type": "text/markdown",
           Allow: "GET",
         },
       });
     }
 
     try {
-      // Parse query parameters
+      // Parse URL path parameters
       const url = new URL(request.url);
-      const prompt = url.searchParams.get("prompt");
-      const size = url.searchParams.get("size") || "1024x1024";
-      const quality = url.searchParams.get("quality") || "low";
-      const nParam = url.searchParams.get("n");
-      const n = nParam ? parseInt(nParam, 10) : 1;
-      const format = url.searchParams.get("format") || "image"; // New parameter to choose response format
+      const pathParams = parseImagePath(url.pathname);
 
-      if (!prompt || typeof prompt !== "string") {
-        const markdown = `# Invalid Request
+      if (!pathParams) {
+        return new Response(
+          `Welcome!
+          
+# Use the following format to generate images:
 
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
+/image/prompt[/size][/quality]
 
-**Error:** Missing or invalid required query parameter: prompt
-`;
-        return new Response(markdown, {
-          status: 400,
-          headers: { "Content-Type": "text/markdown" },
-        });
+- prompt: any text prompt (required)
+- size: 1024x1024 (default), 1024x1536, 1536x1024
+- quality: low (default), medium, high, auto
+
+Examples:
+
+- /image/cat
+- /image/cat/1024x1024  
+- /image/cat/1024x1024/high
+
+# Pricing:
+
+Cost includes: input text tokens + input image tokens + output image tokens
+
+## Output tokens:
+
+| Quality | Square (1024×1024) | Portrait (1024×1536) | Landscape (1536×1024) |
+|---------|--------------------|----------------------|-----------------------|
+| Low     | $0.011             | $0.016               | $0.016                |
+| Medium  | $0.042             | $0.063               | $0.063                |
+| High    | $0.167             | $0.25                | $0.25                 |
+
+## Input tokens (per 1M tokens):
+
+| Type             | Input     | Cached input         | Output                |
+|------------------|-----------|----------------------|-----------------------|
+| Text tokens      | $5.00     | $1.25                | -                     |
+| Image tokens     | $10.00    | $2.50                | $40.00                |
+
+### Image tokens calculation:
+
+Scale image so shortest side = 512px
+Count 512px tiles needed
+Calculate cost: (tiles × 129) + 65 tokens
+
+Examples:
+
+1024×1024 → 512×512 → 1 tile → 194 tokens
+2048×4096 → 512×1024 → 2 tiles → 323 tokens`,
+          {
+            status: 400,
+          }
+        );
       }
 
-      // Validate parameters
-      if (
-        !["256x256", "512x512", "1024x1024", "1024x1792", "1792x1024"].includes(
-          size
-        )
-      ) {
-        const markdown = `# Invalid Request
+      const { prompt, size, quality } = pathParams;
 
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-**Error:** Invalid size. Must be one of: 256x256, 512x512, 1024x1024, 1024x1792, 1792x1024
-`;
-        return new Response(markdown, {
-          status: 400,
-          headers: { "Content-Type": "text/markdown" },
-        });
-      }
-
-      if (
-        typeof quality !== "string" ||
-        !["low", "medium", "high", "auto"].includes(quality)
-      ) {
-        const markdown = `# Invalid Request
-
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-**Error:** Invalid quality. Must be "low", "medium", "high", or "auto"
-`;
-        return new Response(markdown, {
-          status: 400,
-          headers: { "Content-Type": "text/markdown" },
-        });
-      }
-
-      if (isNaN(n) || n < 1 || n > 4) {
-        const markdown = `# Invalid Request
-
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-**Error:** Invalid n. Must be a number between 1 and 4
-`;
-        return new Response(markdown, {
-          status: 400,
-          headers: { "Content-Type": "text/markdown" },
-        });
-      }
-
-      // For image response format, only allow n=1
-      if (format === "image" && n > 1) {
-        const markdown = `# Invalid Request
-
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-**Error:** When format=image, only n=1 is supported. Use format=markdown for multiple images.
-`;
-        return new Response(markdown, {
-          status: 400,
-          headers: { "Content-Type": "text/markdown" },
-        });
-      }
+      console.log("Parsed parameters:", { prompt, size, quality });
 
       // Calculate cost based on image parameters
       let costInCents;
-      if (quality === "high" || quality === "auto") {
-        costInCents = 4 * n; // 4 cents per HD image
+      if (quality === "high" || quality === "auto" || quality === "medium") {
+        costInCents = 4;
       } else {
-        costInCents = 2 * n; // 2 cents per standard image
+        costInCents = 2;
       }
 
       // Add storage cost (minimal)
-      const storageCostInCents = Math.ceil(n * 0.1); // ~0.1 cent per image for storage
+      const storageCostInCents = Math.ceil(1 * 0.1); // ~0.1 cent per image for storage
       const totalCostInCents = costInCents + storageCostInCents;
 
       console.log({ user: ctx.user, prompt, totalCostInCents });
@@ -239,35 +201,27 @@ Use GET method to generate images.
       const { charged, message } = await ctx.charge(totalCostInCents, false);
 
       if (!charged) {
-        const speed = Date.now() - t;
-        const markdown = `# Payment Failed
-
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-**Error:** Could not charge user  
-**Message:** ${message}  
-**Processing Time:** ${speed}ms
-`;
-        return new Response(markdown, {
+        return new Response(`Payment failed: ${message}`, {
           status: 402,
-          headers: { "Content-Type": "text/markdown" },
         });
       }
 
+      const headers = {
+        Authorization: `Bearer ${(env as any).OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+        "User-Agent": "StripeImages/1.0",
+        Accept: "application/json",
+      };
       // Make request to OpenAI API
       const openaiResponse = await fetch(
         "https://api.openai.com/v1/images/generations",
         {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${(env as any).OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
+          headers,
           body: JSON.stringify({
-            model: "dall-e-3", // Updated to use DALL-E 3
+            model: "gpt-image-1",
             prompt: prompt,
-            n: n,
+            n: 1,
             size: size,
             quality: quality,
           }),
@@ -275,196 +229,73 @@ Use GET method to generate images.
       );
 
       if (!openaiResponse.ok) {
-        const errorData = await openaiResponse.json();
+        let errorData;
+        try {
+          errorData = await openaiResponse.text();
+        } catch (e) {
+          errorData = {
+            error: "Failed to parse error response",
+            status: openaiResponse.status,
+          };
+        }
         console.error("OpenAI API Error:", errorData);
-
-        const speed = Date.now() - t;
-        const markdown = `# Image Generation Failed
-
-**User:** ${ctx.user.email}  
-**Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)
-
-**Error:** Image generation failed  
-**Details:** 
-\`\`\`json
-${JSON.stringify(errorData, null, 2)}
-\`\`\`
-
-**Processing Time:** ${speed}ms
-
-> **Note:** You were charged $${totalCostInCents / 100} for this request.
-`;
-        return new Response(markdown, {
-          status: openaiResponse.status,
-          headers: { "Content-Type": "text/markdown" },
-        });
+        return new Response(
+          `Image generation failed: ${JSON.stringify(errorData)}`,
+          {
+            status: openaiResponse.status,
+          }
+        );
       }
 
       const imageData = (await openaiResponse.json()) as any;
 
-      // If format is "image", return the first image directly
-      if (format === "image") {
-        try {
-          const firstImage = imageData.data[0];
-          const imageBuffer = await getImageBuffer(firstImage);
+      // Return the first image directly
+      try {
+        const firstImage = imageData.data[0];
+        console.log("First image data:", firstImage);
+        const imageBuffer = await getImageBuffer(firstImage);
 
-          // Save to R2 in the background (don't await)
-          const filename = generateImageFilename(
-            ctx.user.client_reference_id,
-            prompt,
-            0
-          );
-          saveImageToR2(env, imageBuffer, filename, false).catch((error) => {
-            console.error("Background save to R2 failed:", error);
-          });
+        // Save to R2 in the background (don't await)
+        const filename = generateImageFilename(prompt);
+        saveImageToR2(env, imageBuffer, filename, false).catch((error) => {
+          console.error("Background save to R2 failed:", error);
+        });
 
-          // Return the image directly
-          return new Response(imageBuffer, {
-            status: 200,
-            headers: {
-              "Content-Type": "image/png",
-              "Content-Disposition": `inline; filename="${filename}"`,
-              "Access-Control-Allow-Origin": "*",
-              "Access-Control-Allow-Methods": "GET",
-              "Access-Control-Allow-Headers": "Content-Type",
-              "Cache-Control": "public, max-age=3600", // Cache for 1 hour
-            },
-          });
-        } catch (error) {
-          console.error("Failed to process image:", error);
-          const markdown = `# Image Processing Failed
+        console.log("Image saved to R2:", filename);
 
-**User:** ${ctx.user.email}  
-**Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)
-
-**Error:** Failed to process generated image  
-**Message:** ${error instanceof Error ? error.message : "Unknown error"}
-
-> **Note:** You were charged $${totalCostInCents / 100} for this request.
-`;
-          return new Response(markdown, {
+        // Return the image directly
+        return new Response(imageBuffer, {
+          status: 200,
+          headers: {
+            "Content-Type": "image/png",
+            "Content-Disposition": `inline; filename="${filename}"`,
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET",
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Cache-Control": "public, max-age=3600", // Cache for 1 hour
+          },
+        });
+      } catch (error) {
+        console.error("Failed to process image:", error);
+        return new Response(
+          `Image processing failed: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`,
+          {
             status: 500,
-            headers: { "Content-Type": "text/markdown" },
-          });
-        }
-      }
-
-      // Original markdown response for multiple images or when format=markdown
-      const savedImageUrls: string[] = [];
-
-      for (let i = 0; i < imageData.data.length; i++) {
-        const image = imageData.data[i];
-        const filename = generateImageFilename(
-          ctx.user.client_reference_id,
-          prompt,
-          i
+          }
         );
-
-        try {
-          let savedUrl: string;
-
-          if (image.url) {
-            // Save from URL
-            savedUrl = await saveImageToR2(env, image.url, filename, false);
-          } else if (image.b64_json) {
-            // Save from base64
-            savedUrl = await saveImageToR2(env, image.b64_json, filename, true);
-          } else {
-            throw new Error("No image data found");
-          }
-
-          savedImageUrls.push(savedUrl);
-        } catch (error) {
-          console.error(`Failed to save image ${i}:`, error);
-          // Fallback to original URL or base64
-          if (image.url) {
-            savedImageUrls.push(image.url);
-          } else if (image.b64_json) {
-            savedImageUrls.push(`data:image/png;base64,${image.b64_json}`);
-          }
-        }
       }
-
-      const speed = Date.now() - t;
-
-      // Generate markdown content with saved URLs and image rendering
-      let imagesMarkdown = "";
-      savedImageUrls.forEach((imageUrl: string, index: number) => {
-        imagesMarkdown += `
-### Image ${index + 1}
-
-![Generated Image ${index + 1}](${imageUrl})
-
-**Direct Link:** [🔗 ${imageUrl}](${imageUrl})
-
----
-`;
-      });
-
-      const markdownContent = `# 🎨 Image Generation Complete
-
-✅ **Successfully generated and saved ${savedImageUrls.length} image${
-        savedImageUrls.length > 1 ? "s" : ""
-      }**
-
-## 📊 Generation Details
-
-**👤 User:** ${ctx.user.email}  
-**💰 Balance:** $${(ctx.user.balance - totalCostInCents) / 100} (after charge)  
-**💸 Cost:** $${totalCostInCents / 100}  
-**⏱️ Processing Time:** ${speed}ms
-
-## 📝 Prompt
-
-> *"${prompt}"*
-
-## ⚙️ Settings
-
-| Setting | Value |
-|---------|-------|
-| **Size** | ${size} |
-| **Quality** | ${quality} |
-| **Count** | ${n} |
-
-## 🖼️ Generated Images
-
-${imagesMarkdown}
-
-## 💾 Storage Info
-
-Your images are permanently stored and accessible via the direct links above. Images are cached for optimal performance and availability.
-
-## 💡 Tip
-
-Add \`?format=image\` to your URL to get the image directly instead of this markdown response (only works with n=1).`;
-
-      return new Response(markdownContent, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/markdown",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET",
-          "Access-Control-Allow-Headers": "Content-Type",
-        },
-      });
     } catch (error) {
-      const speed = Date.now() - t;
       console.error("Worker Error:", error);
-
-      const markdown = `# Internal Server Error
-
-**User:** ${ctx.user.email}  
-**Balance:** $${ctx.user.balance / 100}
-
-**Error:** Internal server error  
-**Message:** ${error instanceof Error ? error.message : "Unknown error"}  
-**Processing Time:** ${speed}ms
-`;
-
-      return new Response(markdown, {
-        status: 500,
-        headers: { "Content-Type": "text/markdown" },
-      });
+      return new Response(
+        `Internal server error: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+        {
+          status: 500,
+        }
+      );
     }
   }),
 };
