@@ -11,7 +11,7 @@ export { DORM };
 // TYPES
 // =============================================================================
 
-type Env = StripeflareEnv & {
+type ExtendedEnv = StripeflareEnv & {
   stripeimages: R2Bucket;
   R2_PUBLIC_URL: string | undefined;
   R2_DEV_URL: string | undefined;
@@ -208,7 +208,7 @@ export function calculateImageGenerationCost(
 // =============================================================================
 
 async function saveImageToR2(
-  env: Env,
+  env: ExtendedEnv,
   imageData: string | ArrayBuffer,
   filename: string,
   isBase64: boolean = false
@@ -249,7 +249,7 @@ async function saveImageToR2(
 }
 
 async function getImageFromR2(
-  env: Env,
+  env: ExtendedEnv,
   filename: string
 ): Promise<Response | null> {
   const stored = await env.stripeimages.get(filename);
@@ -273,7 +273,7 @@ async function getImageFromR2(
 // =============================================================================
 
 async function generateImage(
-  env: Env,
+  env: ExtendedEnv,
   params: ImageParams
 ): Promise<ArrayBuffer> {
   const response = await fetch("https://api.openai.com/v1/images/generations", {
@@ -480,7 +480,7 @@ function createErrorResponse(message: string, status: number = 400): Response {
 
 async function handleCostRequest(
   request: Request,
-  env: Env,
+  env: ExtendedEnv,
   ctx: any
 ): Promise<Response> {
   const url = new URL(request.url);
@@ -496,7 +496,7 @@ async function handleCostRequest(
 
 async function handleImageRequest(
   request: Request,
-  env: Env,
+  env: ExtendedEnv,
   ctx: any
 ): Promise<Response> {
   const url = new URL(request.url);
@@ -559,7 +559,8 @@ async function handleImageRequest(
 // =============================================================================
 
 export default {
-  fetch: withStripeflare<StripeUser>(async (request, env: Env, ctx) => {
+  fetch: withStripeflare<StripeUser>(async (request, env, ctx) => {
+    const extendedEnv = env as ExtendedEnv;
     try {
       // Handle CORS preflight
       if (request.method === "OPTIONS") {
@@ -578,9 +579,9 @@ export default {
 
       // Route requests
       if (url.pathname.startsWith("/cost")) {
-        return await handleCostRequest(request, env, ctx);
+        return await handleCostRequest(request, extendedEnv, ctx);
       } else {
-        return await handleImageRequest(request, env, ctx);
+        return await handleImageRequest(request, extendedEnv, ctx);
       }
     } catch (error) {
       console.error("Worker Error:", error);
