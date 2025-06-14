@@ -29,13 +29,11 @@ interface ImageCostBreakdown {
   imageInputTokens: number;
   imageInputCost: number;
   imageOutputCost: number;
-  storageCost: number;
   totalCostInCents: number;
   breakdown: {
     textInput: string;
     imageInput: string;
     imageOutput: string;
-    storage: string;
     total: string;
   };
 }
@@ -72,14 +70,13 @@ const PRICING = {
       "1536x1024": 0.25,
     },
   },
-
-  STORAGE_COST_PER_IMAGE: 0.001, // $0.001 per image for storage
+  FEE_PERCENTAGE_PER_IMAGE: 0.1, // 10% fee on total cost
 };
 
 /**
  * Calculate image tokens based on dimensions
  * Formula: Scale image so shortest side = 512px, count 512px tiles needed
- * Cost: (tiles × 129) + 65 tokens
+ * Cost: (tiles x 129) + 65 tokens
  */
 function calculateImageTokens(width: number, height: number): number {
   // Scale so shortest side = 512px
@@ -94,7 +91,7 @@ function calculateImageTokens(width: number, height: number): number {
   const tilesY = Math.ceil(scaledHeight / 512);
   const totalTiles = tilesX * tilesY;
 
-  // Calculate tokens: (tiles × 129) + 65
+  // Calculate tokens: (tiles x 129) + 65
   return totalTiles * 129 + 65;
 }
 
@@ -158,12 +155,12 @@ export function calculateImageGenerationCost(
     imageOutputCost = PRICING.OUTPUT_COSTS[normalizedQuality][size];
   }
 
-  // Storage cost
-  const storageCost = PRICING.STORAGE_COST_PER_IMAGE;
+  // Fee cost
+  const feePercentage = PRICING.FEE_PERCENTAGE_PER_IMAGE;
 
   // Total cost in dollars
   const totalCostInDollars =
-    (textInputCost + imageInputCost + imageOutputCost + storageCost) * 0.2; // 20% fee
+    (textInputCost + imageInputCost + imageOutputCost) * feePercentage;
   const totalCostInCents = Math.ceil(totalCostInDollars * 100);
 
   return {
@@ -172,7 +169,6 @@ export function calculateImageGenerationCost(
     imageInputTokens: inputImageTokens,
     imageInputCost,
     imageOutputCost,
-    storageCost,
     totalCostInCents,
     breakdown: {
       textInput: `$${textInputCost.toFixed(
@@ -187,7 +183,6 @@ export function calculateImageGenerationCost(
       imageOutput: `$${imageOutputCost.toFixed(
         5
       )} (${imageOutputTokens.toLocaleString()} tokens)`,
-      storage: `$${storageCost.toFixed(5)}`,
       total: `$${totalCostInDollars.toFixed(5)} (${totalCostInCents}¢)`,
     },
   };
@@ -317,6 +312,9 @@ export default {
           "Content-Type": already.httpMetadata?.contentType || "image/png",
           "Content-Disposition": `inline; filename="${filename}"`,
           "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, Cookie",
+          "Cache-Control": "public, max-age=3600", // Cache for 1 hour
         },
       });
     }
@@ -347,6 +345,11 @@ export default {
             headers: {
               "Content-Type": "application/json",
               "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Methods": "GET",
+              "Access-Control-Allow-Headers":
+                "Authorization, Content-Type, Cookie",
+              "Cache-Control": "no-cache",
+              "Access-Control-Max-Age": "86400", // Cache preflight for 1 day
             },
           }
         );
@@ -375,7 +378,6 @@ export default {
             imageInputTokens: costBreakdown.imageInputTokens,
             imageInputCost: costBreakdown.imageInputCost,
             imageOutputCost: costBreakdown.imageOutputCost,
-            storageCost: costBreakdown.storageCost,
           },
         },
         generation: {
@@ -402,7 +404,9 @@ export default {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET",
-          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, Cookie",
+          "Cache-Control": "no-cache",
+          "Access-Control-Max-Age": "86400", // Cache preflight for 1 day
         },
       });
     }
@@ -433,13 +437,14 @@ export default {
       // Parse URL path parameters
       const pathParams = parseImagePath(url.pathname);
 
-      if (!pathParams) {
-        return new Response(
-          `Welcome to image.brubslabs.com!
-          
+      const landingPage = `Welcome to image.brubslabs.com!
+
+Your Balance: $${(ctx.user.balance / 100).toFixed(2)}
+Your Access Token: ${ctx.user.access_token}
+
 # Use the following format to generate images:
 
-/image/prompt[/size][/quality]
+https://image.brubslabs.com/image/prompt[/size][/quality]
 
 - prompt: any text prompt (required)
 - size: 1024x1024 (default), 1024x1536, 1536x1024
@@ -451,13 +456,23 @@ Examples:
 - /image/cat/1024x1024  
 - /image/cat/1024x1024/high
 
+# Access Token Usage:
+
+curl -X GET \\\n
+  -H "Cookie: access_token=your-access-token" \\\n
+  "https://image.brubslabs.com/image/cat/1024x1024/high"
+
+Note: Add URL-encode spaces in the prompt (e.g., '%20' for spaces)
+
 # Pricing:
 
-Cost includes: input text tokens + input image tokens + output image tokens
+Cost includes: (input text tokens + input image tokens + output image tokens) * fee percentage
+
+Fee percentage: 10% of total cost
 
 ## Output tokens:
 
-| Quality | Square (1024×1024) | Portrait (1024×1536) | Landscape (1536×1024) |
+| Quality | Square (1024x1024) | Portrait (1024x1536) | Landscape (1536x1024) |
 |---------|--------------------|----------------------|-----------------------|
 | Low     | $0.011             | $0.016               | $0.016                |
 | Medium  | $0.042             | $0.063               | $0.063                |
@@ -470,20 +485,32 @@ Cost includes: input text tokens + input image tokens + output image tokens
 | Text tokens      | $5.00     | $1.25                | -                     |
 | Image tokens     | $10.00    | $2.50                | $40.00                |
 
-### Image tokens calculation:
+### Image tokens calculation (comming soon):
 
 Scale image so shortest side = 512px
 Count 512px tiles needed
-Calculate cost: (tiles × 129) + 65 tokens
+Calculate cost: (tiles x 129) + 65 tokens
 
 Examples:
 
-1024×1024 → 512×512 → 1 tile → 194 tokens
-2048×4096 → 512×1024 → 2 tiles → 323 tokens`,
-          {
-            status: 400,
-          }
-        );
+1024x1024 → 512x512 → 1 tile → 194 tokens
+2048x4096 → 512x1024 → 2 tiles → 323 tokens`;
+
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, Cookie",
+        "Access-Control-Max-Age": "86400",
+      } as const;
+
+      if (!pathParams) {
+        return new Response(landingPage, {
+          headers: {
+            "Content-Type": "text/plain",
+            ...corsHeaders,
+          },
+          status: 400,
+        });
       }
 
       const { prompt, size, quality } = pathParams;
@@ -548,6 +575,10 @@ Examples:
         return new Response(
           `Image generation failed: ${JSON.stringify(errorData)}`,
           {
+            headers: {
+              "Content-Type": "application/json",
+              ...corsHeaders,
+            },
             status: openaiResponse.status,
           }
         );
@@ -590,7 +621,8 @@ Examples:
             "Content-Disposition": `inline; filename="${filename}"`,
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET",
-            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Headers":
+              "Authorization, Content-Type, Cookie",
             "Cache-Control": "public, max-age=3600", // Cache for 1 hour
           },
         });
@@ -601,6 +633,13 @@ Examples:
             error instanceof Error ? error.message : "Unknown error"
           }`,
           {
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Methods": "GET",
+              "Access-Control-Allow-Headers":
+                "Authorization, Content-Type, Cookie",
+            },
             status: 500,
           }
         );
@@ -612,6 +651,13 @@ Examples:
           error instanceof Error ? error.message : "Unknown error"
         }`,
         {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET",
+            "Access-Control-Allow-Headers":
+              "Authorization, Content-Type, Cookie",
+          },
           status: 500,
         }
       );
